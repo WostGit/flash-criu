@@ -159,6 +159,19 @@ jobs:
 
               fprintf(stderr, "TARGET_READY\n");
               fflush(stderr);
+              int ready = open("/tmp/ready", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+              if (ready >= 0) {
+                  if (write(ready, "ready\n", 6) != 6) _exit(2);
+                  close(ready);
+              }
+              /* Drop Docker's log pipes so the dump does not depend on them. */
+              int devnull = open("/dev/null", O_RDWR);
+              if (devnull >= 0) {
+                  dup2(devnull, 0);
+                  dup2(devnull, 1);
+                  dup2(devnull, 2);
+                  if (devnull > 2) close(devnull);
+              }
               for (;;) {
                   pause();
                   if (snap) {
@@ -180,6 +193,7 @@ jobs:
           docker create \
             --name egym-target \
             --runtime runc \
+            --network none \
             --user 0 \
             --security-opt seccomp=unconfined \
             --security-opt apparmor=unconfined \
@@ -188,7 +202,8 @@ jobs:
           docker cp "${WORKDIR}/stage1-probe" egym-target:/stage1-probe
           docker start egym-target
           for _ in $(seq 1 30); do
-            if docker logs egym-target 2>&1 | grep -q TARGET_READY; then
+            if docker logs egym-target 2>&1 | grep -q TARGET_READY \
+              || docker exec egym-target cat /tmp/ready >/dev/null 2>&1; then
               docker inspect -f '{{.State.Pid}}' egym-target > /tmp/target.pid
               echo "Target ready pid=$(cat /tmp/target.pid)"
               exit 0
@@ -291,6 +306,63 @@ jobs:
                   "starttime": starttime,
               }
 
+          def locate(cid):
+              roots = ["/run/docker/runtime-runc/moby", "/var/run/docker/runtime-runc/moby"]
+              found = run([
+                  "bash", "-lc",
+                  f"sudo find /run /var/run -path '*{cid}/state.json' 2>/dev/null || true",
+              ], check=False)
+              for state in (found.stdout or "").splitlines():
+                  state = state.strip()
+                  if not state:
+                      continue
+                  root = str(Path(state).parent.parent)
+                  if root not in roots:
+                      roots.append(root)
+              errors = []
+              for root in roots:
+                  p = run(["sudo", "runc", "--root", root, "state", cid], check=False)
+                  text = p.stdout or ""
+                  i = text.find("{")
+                  if p.returncode == 0 and i >= 0:
+                      try:
+                          info = json.loads(text[i:])
+                      except json.JSONDecodeError as exc:
+                          errors.append(f"{root}: {exc}")
+                          continue
+                      if "bundle" in info:
+                          return root, info
+                      errors.append(f"{root}: no bundle key in {list(info)[:8]}")
+                  else:
+                      tail = ((p.stderr or "") + text)[-400:]
+                      errors.append(f"{root}: rc={p.returncode} {tail}")
+              raise RuntimeError("could not locate runc bundle:\n" + "\n".join(errors))
+
+          def log_tail(path, limit=80):
+              lines = []
+              try:
+                  files = list(Path(path).rglob("*"))
+              except OSError:
+                  return ""
+              for f in sorted(files):
+                  try:
+                      if not f.is_file() or f.stat().st_size > 2_000_000:
+                          continue
+                      if f.suffix not in {".log", ".txt"} and "log" not in f.name:
+                          continue
+                      if os.access(f, os.R_OK):
+                          chunk = f.read_text(errors="replace").splitlines()
+                      else:
+                          p = subprocess.run(["sudo", "cat", str(f)], capture_output=True, text=True)
+                          if p.returncode != 0:
+                              continue
+                          chunk = p.stdout.splitlines()
+                  except OSError:
+                      continue
+                  lines.append(f"--- {f} ---")
+                  lines.extend(chunk[-limit:])
+              return "\n".join(lines[-limit * 4:])
+
           def page_hashes(root: Path, nonce: bytes):
               files = sorted(root.glob("pages-*.img"))
               if not files:
@@ -321,15 +393,7 @@ jobs:
           restored_id = f"restored-{turn:02d}"
           try:
               cid = run(["docker", "inspect", "-f", "{{.Id}}", "egym-target"]).stdout.strip()
-              state = run([
-                  "bash", "-lc",
-                  f"sudo find /run /var/run -path '*{cid}/state.json' 2>/dev/null | head -1",
-              ]).stdout.strip()
-              if not state:
-                  raise RuntimeError(f"runc state.json not found for {cid}")
-              info = json.loads(Path(state).read_text() if os.access(state, os.R_OK)
-                                 else run(["sudo", "cat", state]).stdout)
-              runc_root = str(Path(state).parent.parent)
+              runc_root, info = locate(cid)
               bundle = info["bundle"]
               live = int(Path("/tmp/target.pid").read_text().strip())
 
@@ -420,7 +484,10 @@ jobs:
               ok = True
           except Exception as e:
               err = str(e)
-              result["error"] = err
+              extra = log_tail(ckpt)
+              if extra:
+                  err = err + "\n" + extra
+              result["error"] = err[-8000:]
           finally:
               run(["sudo", "runc", "--root", "/tmp/runc-restore", "delete", "-f", restored_id], check=False)
               result["checkpoint_ok"] = ok
