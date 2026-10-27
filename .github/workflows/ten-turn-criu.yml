@@ -75,6 +75,7 @@ jobs:
           sudo make install-criu
           sudo ldconfig
           sudo ln -sfn /usr/local/sbin/criu /usr/local/bin/criu
+          sudo ln -sfn /usr/local/sbin/criu /usr/bin/criu
           criu --version
 
       - name: Workspace + Python
@@ -91,36 +92,80 @@ jobs:
           cat > "${{ env.WORKDIR }}/probe.c" << 'EOF'
           #define _GNU_SOURCE
           #include <stdio.h>
-          #include <stdlib.h>
+          #include <stdint.h>
+          #include <string.h>
           #include <unistd.h>
           #include <signal.h>
           #include <fcntl.h>
-          #include <time.h>
+          #include <sys/mman.h>
+          #include <sys/time.h>
+          #include <sys/random.h>
 
-          static unsigned char nonce[8];
-          static unsigned long counter = 0;
+          /* One anonymous page. counter is the first 8 bytes, nonce the next 8.
+             The rest stays zero so a masked hash of this page ignores the tick. */
+          struct state_page {
+              volatile uint64_t counter;
+              unsigned char nonce[8];
+              unsigned char pad[4096 - sizeof(uint64_t) - 8];
+          };
+          _Static_assert(sizeof(struct state_page) == 4096, "state page size");
 
-          void on_usr1(int sig) {
-            (void)sig;
-            counter++;
-            int fd = open("/tmp/probe_state", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd >= 0) {
-              write(fd, nonce, 8);
-              write(fd, &counter, sizeof(counter));
-              close(fd);
-            }
-            fprintf(stderr, "PROBE counter=%lu\n", counter);
-            fflush(stderr);
+          static struct state_page *st;
+          static volatile sig_atomic_t snap;
+
+          static void on_alrm(int sig) {
+              (void)sig;
+              st->counter++;
+          }
+
+          static void on_usr1(int sig) {
+              (void)sig;
+              snap = 1;
+          }
+
+          static void write_snapshot(void) {
+              uint64_t c = st->counter;
+              int fd = open("/tmp/probe_state", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+              if (fd >= 0) {
+                  if (write(fd, st->nonce, 8) != 8) _exit(2);
+                  if (write(fd, &c, sizeof(c)) != (ssize_t)sizeof(c)) _exit(2);
+                  close(fd);
+              }
+              fprintf(stderr, "STAGE1_PROBE event=snapshot nonce=");
+              for (int i = 0; i < 8; i++) fprintf(stderr, "%02x", st->nonce[i]);
+              fprintf(stderr, " counter=%llu\n", (unsigned long long)c);
+              fflush(stderr);
           }
 
           int main(void) {
-            srand((unsigned)time(NULL) ^ getpid());
-            for (int i = 0; i < 8; i++) nonce[i] = rand() & 0xff;
-            signal(SIGUSR1, on_usr1);
-            fprintf(stderr, "TARGET_READY\n");
-            fflush(stderr);
-            for (;;) pause();
-            return 0;
+              st = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+              if (st == MAP_FAILED) return 1;
+              memset(st, 0, 4096);
+              if (getrandom(st->nonce, 8, 0) != 8) return 1;
+
+              struct sigaction sa;
+              memset(&sa, 0, sizeof(sa));
+              sa.sa_handler = on_alrm;
+              sigaction(SIGALRM, &sa, NULL);
+              sa.sa_handler = on_usr1;
+              sigaction(SIGUSR1, &sa, NULL);
+
+              struct itimerval it;
+              it.it_interval.tv_sec = 0;
+              it.it_interval.tv_usec = 100000;
+              it.it_value = it.it_interval;
+              setitimer(ITIMER_REAL, &it, NULL);
+
+              fprintf(stderr, "TARGET_READY\n");
+              fflush(stderr);
+              for (;;) {
+                  pause();
+                  if (snap) {
+                      snap = 0;
+                      write_snapshot();
+                  }
+              }
           }
           EOF
           gcc -static -O2 -o "${{ env.WORKDIR }}/stage1-probe" "${{ env.WORKDIR }}/probe.c"
@@ -155,44 +200,256 @@ jobs:
           exit 1
           EOF
 
+          cat > "${{ env.WORKDIR }}/scripts/checkpoint_turn.py" << 'EOF'
+          #!/usr/bin/env python3
+          """Checkpoint the live target, restore a copy, and compare memory.
+
+          Pass requires:
+            - restored nonce == dumped nonce
+            - restored counter >= dumped counter
+            - sha256 of the 4KiB state page, with the 8 counter bytes zeroed,
+              is the same in the second dump as in the first
+          The full pages-*.img sha256 is recorded and is not required to match:
+          the counter (and the stack) change after restore.
+          """
+          import hashlib, json, os, subprocess, time
+          from pathlib import Path
+
+          turn = int(os.environ.get("TURN") or __import__("sys").argv[1])
+          ckpt = Path(os.environ["CKPT_ROOT"]) / f"turn-{turn:02d}"
+          ckpt.mkdir(parents=True, exist_ok=True)
+          after = ckpt / "after"
+          result = {
+              "turn": turn,
+              "checkpoint_ok": False,
+          }
+
+          def run(cmd, check=True):
+              p = subprocess.run(cmd, capture_output=True, text=True)
+              if check and p.returncode != 0:
+                  raise RuntimeError(
+                      "$ " + " ".join(cmd) + "\n" + (p.stdout or "") + (p.stderr or "")
+                  )
+              return p
+
+          def chown(path):
+              run(["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", str(path)])
+
+          def snapshot(pid):
+              run(["sudo", "kill", "-USR1", str(pid)])
+              time.sleep(0.35)
+              data = subprocess.check_output(
+                  ["sudo", "nsenter", "-t", str(pid), "-m", "cat", "/tmp/probe_state"]
+              )
+              if len(data) < 16:
+                  raise RuntimeError(f"short probe_state from pid {pid}: {data!r}")
+              nonce = data[:8]
+              counter = int.from_bytes(data[8:16], "little")
+              return nonce, counter
+
+          def proc_stats(pid):
+              def text(path):
+                  p = subprocess.run(["sudo", "cat", path], capture_output=True, text=True)
+                  return p.stdout if p.returncode == 0 else ""
+
+              status = text(f"/proc/{pid}/status")
+              vals = {}
+              for line in status.splitlines():
+                  if ":" not in line:
+                      continue
+                  k, v = line.split(":", 1)
+                  vals[k] = v.strip()
+
+              def kb(key):
+                  raw = vals.get(key, "").split()
+                  return int(raw[0]) if raw and raw[0].isdigit() else None
+
+              pss = None
+              for line in text(f"/proc/{pid}/smaps_rollup").splitlines():
+                  if line.startswith("Pss:"):
+                      pss = int(line.split()[1])
+              stat = text(f"/proc/{pid}/stat")
+              starttime = None
+              if ")" in stat:
+                  fields = stat[stat.rfind(")") + 2 :].split()
+                  if len(fields) >= 20:
+                      starttime = int(fields[19])
+              mem = None
+              for line in text(f"/proc/{pid}/cgroup").splitlines():
+                  path = line.split(":", 2)[-1]
+                  raw = text("/sys/fs/cgroup" + path + "/memory.current").strip()
+                  if raw.isdigit():
+                      mem = int(raw)
+                      break
+              return {
+                  "host_pid": int(pid),
+                  "rss_kb": kb("VmRSS"),
+                  "pss_kb": pss,
+                  "vmhwm_kb": kb("VmHWM"),
+                  "vmsize_kb": kb("VmSize"),
+                  "cgroup_memory_current": mem,
+                  "starttime": starttime,
+              }
+
+          def page_hashes(root: Path, nonce: bytes):
+              files = sorted(root.glob("pages-*.img"))
+              if not files:
+                  raise RuntimeError(f"no pages-*.img in {root}")
+              full = hashlib.sha256()
+              masked = None
+              for f in files:
+                  data = f.read_bytes()
+                  full.update(f.name.encode() + b"\0")
+                  full.update(data)
+                  start = 0
+                  while True:
+                      i = data.find(nonce, start)
+                      if i < 0:
+                          break
+                      if i % 4096 == 8:
+                          chunk = bytearray(data[i - 8 : i - 8 + 4096])
+                          if len(chunk) == 4096 and chunk[16:] == b"\x00" * (4096 - 16):
+                              chunk[0:8] = b"\x00" * 8
+                              masked = hashlib.sha256(chunk).hexdigest()
+                      start = i + 1
+              if masked is None:
+                  raise RuntimeError(f"nonce {nonce.hex()} not found on a state page in {root}")
+              return full.hexdigest(), masked
+
+          ok = False
+          err = None
+          restored_id = f"restored-{turn:02d}"
+          try:
+              cid = run(["docker", "inspect", "-f", "{{.Id}}", "egym-target"]).stdout.strip()
+              state = run([
+                  "bash", "-lc",
+                  f"sudo find /run /var/run -path '*{cid}/state.json' 2>/dev/null | head -1",
+              ]).stdout.strip()
+              if not state:
+                  raise RuntimeError(f"runc state.json not found for {cid}")
+              info = json.loads(Path(state).read_text() if os.access(state, os.R_OK)
+                                 else run(["sudo", "cat", state]).stdout)
+              runc_root = str(Path(state).parent.parent)
+              bundle = info["bundle"]
+              live = int(Path("/tmp/target.pid").read_text().strip())
+
+              nonce, counter_before = snapshot(live)
+              before = proc_stats(live)
+              result["nonce"] = nonce.hex()
+              result["counter_before"] = counter_before
+              result["before"] = before
+
+              images = ckpt / "images"
+              images.mkdir(exist_ok=True)
+              work = ckpt / "work"
+              work.mkdir(exist_ok=True)
+              run([
+                  "sudo", "runc", "--root", runc_root, "checkpoint",
+                  "--image-path", str(images),
+                  "--work-path", str(work),
+                  "--leave-running",
+                  "--ext-unix-sk",
+                  "--shell-job",
+                  "--manage-cgroups-mode", "ignore",
+                  cid,
+              ])
+              chown(ckpt)
+              if not (images / "inventory.img").exists():
+                  raise RuntimeError("checkpoint wrote no inventory.img")
+
+              pages_sha, masked = page_hashes(images, nonce)
+              result["pages_sha256"] = pages_sha
+              result["state_page_masked_sha256"] = masked
+
+              run(["sudo", "mkdir", "-p", "/tmp/runc-restore"])
+              run(["sudo", "runc", "--root", "/tmp/runc-restore", "delete", "-f", restored_id], check=False)
+              work_r = ckpt / "work-restore"
+              work_r.mkdir(exist_ok=True)
+              pidfile = ckpt / "restored.pid"
+              run([
+                  "sudo", "runc", "--root", "/tmp/runc-restore", "restore",
+                  "--bundle", bundle,
+                  "--image-path", str(images),
+                  "--work-path", str(work_r),
+                  "--detach",
+                  "--pid-file", str(pidfile),
+                  "--ext-unix-sk",
+                  "--shell-job",
+                  "--manage-cgroups-mode", "ignore",
+                  restored_id,
+              ])
+              chown(ckpt)
+              restored_pid = int(pidfile.read_text().strip())
+              nonce2, counter_after = snapshot(restored_pid)
+              after_stats = proc_stats(restored_pid)
+              result["counter_after"] = counter_after
+              result["after"] = after_stats
+              if nonce2 != nonce:
+                  raise RuntimeError(
+                      f"nonce mismatch dumped={nonce.hex()} restored={nonce2.hex()}"
+                  )
+              if counter_after < counter_before:
+                  raise RuntimeError(
+                      f"counter went backwards {counter_before} -> {counter_after}"
+                  )
+
+              after.mkdir(exist_ok=True)
+              work_a = ckpt / "work-after"
+              work_a.mkdir(exist_ok=True)
+              run([
+                  "sudo", "runc", "--root", "/tmp/runc-restore", "checkpoint",
+                  "--image-path", str(after),
+                  "--work-path", str(work_a),
+                  "--leave-running",
+                  "--ext-unix-sk",
+                  "--shell-job",
+                  "--manage-cgroups-mode", "ignore",
+                  restored_id,
+              ])
+              chown(ckpt)
+              pages_sha2, masked2 = page_hashes(after, nonce)
+              result["pages_sha256_after"] = pages_sha2
+              result["state_page_masked_sha256_after"] = masked2
+              result["pages_differ"] = pages_sha != pages_sha2
+              if masked2 != masked:
+                  raise RuntimeError(
+                      "state page mismatch\n"
+                      f"  dump   {masked}\n"
+                      f"  restore {masked2}"
+                  )
+              ok = True
+          except Exception as e:
+              err = str(e)
+              result["error"] = err
+          finally:
+              run(["sudo", "runc", "--root", "/tmp/runc-restore", "delete", "-f", restored_id], check=False)
+              result["checkpoint_ok"] = ok
+              (ckpt / "result.json").write_text(json.dumps(result, indent=2))
+              print(json.dumps(result, indent=2))
+              if err:
+                  print(err, flush=True)
+          raise SystemExit(0 if ok else 1)
+          EOF
+
           cat > "${{ env.WORKDIR }}/scripts/criu_checkpoint.sh" << 'EOF'
           #!/usr/bin/env bash
           set -euo pipefail
           TURN=$1
-          CKPT_DIR="${CKPT_ROOT}/turn-$(printf '%02d' "$TURN")"
-          mkdir -p "$CKPT_DIR/work"
-          CID=$(docker inspect -f '{{.Id}}' egym-target)
-          STATE=$(sudo find /run /var/run -path "*${CID}/state.json" 2>/dev/null | head -1 || true)
-          if [[ -z "$STATE" ]]; then
-            echo "runc state.json not found for $CID" >&2
-            exit 1
-          fi
-          RUNC_ROOT=$(dirname "$(dirname "$STATE")")
-          echo "runc checkpoint root=$RUNC_ROOT id=$CID dir=$CKPT_DIR"
-          sudo runc --root "$RUNC_ROOT" checkpoint \
-            --image-path "$CKPT_DIR" \
-            --work-path "$CKPT_DIR/work" \
-            --leave-running \
-            --ext-unix-sk \
-            --shell-job \
-            --manage-cgroups-mode ignore \
-            "$CID"
-          sudo chown -R "$(id -u):$(id -g)" "$CKPT_DIR"
-          test -f "$CKPT_DIR/core-1.img" -o -f "$CKPT_DIR/inventory.img"
-          echo "Dump OK"
-          ls -la "$CKPT_DIR"
+          export TURN
+          python3 "${WORKDIR}/scripts/checkpoint_turn.py" "$TURN"
           EOF
 
           cat > "${{ env.WORKDIR }}/scripts/read_invariant.sh" << 'EOF'
           #!/usr/bin/env bash
           set -euo pipefail
-          docker kill --signal=SIGUSR1 egym-target >/dev/null
-          sleep 0.3
-          docker exec egym-target cat /tmp/probe_state | xxd -p | tr -d '\n'
+          PID=$(cat /tmp/target.pid)
+          sudo kill -USR1 "$PID"
+          sleep 0.35
+          sudo nsenter -t "$PID" -m cat /tmp/probe_state | xxd -p | tr -d '\n'
           echo
           EOF
 
-          chmod +x "${{ env.WORKDIR }}/scripts/"*.sh
+          chmod +x "${{ env.WORKDIR }}/scripts/"*.sh "${{ env.WORKDIR }}/scripts/checkpoint_turn.py"
 
       - name: 10-turn agent + per-turn CRIU
         env:
@@ -210,6 +467,7 @@ jobs:
 
           python3 - << 'PY'
           import os, json, time, subprocess
+          from pathlib import Path
           from openai import OpenAI
 
           client = OpenAI(
@@ -220,6 +478,7 @@ jobs:
           MAX_TURNS = int(os.environ["MAX_TURNS"])
           WORKDIR = os.environ["WORKDIR"]
           LOG_ROOT = os.environ["LOG_ROOT"]
+          CKPT_ROOT = Path(os.environ["CKPT_ROOT"])
 
           def log(msg):
               line = time.strftime("%Y-%m-%d %H:%M:%S ") + msg
@@ -233,8 +492,12 @@ jobs:
               log(r.stdout)
               if r.returncode != 0:
                   log("CRIU FAIL: " + r.stderr)
-                  return False
-              return True
+              extra = {}
+              p = CKPT_ROOT / f"turn-{turn:02d}" / "result.json"
+              if p.exists():
+                  extra = json.loads(p.read_text())
+              ok = bool(extra.get("checkpoint_ok")) and r.returncode == 0
+              return ok, extra
 
           def invariant():
               r = subprocess.run(
@@ -267,14 +530,29 @@ jobs:
               history.append({"role": "user", "content": f"Turn {turn} complete. Continue."})
               log(f"Model: {msg[:240]}")
 
-              ok = criu(turn)
+              ok, extra = criu(turn)
               inv = invariant()
-              summary.append({"turn": turn, "checkpoint_ok": ok, "invariant": inv})
-              log(f"Invariant: {inv}")
+              row = {"turn": turn, "invariant": inv}
+              row.update(extra)
+              row["checkpoint_ok"] = ok
+              summary.append(row)
+              log(
+                  "ok=%s nonce=%s counter=%s->%s pages=%s masked=%s"
+                  % (
+                      ok,
+                      row.get("nonce"),
+                      row.get("counter_before"),
+                      row.get("counter_after"),
+                      (row.get("pages_sha256") or "")[:12],
+                      (row.get("state_page_masked_sha256") or "")[:12],
+                  )
+              )
               time.sleep(1.5)
 
           open(f"{LOG_ROOT}/summary.json", "w").write(json.dumps(summary, indent=2))
           log("Done")
+          if not summary or not all(s.get("checkpoint_ok") for s in summary):
+              raise SystemExit(1)
           PY
 
       - name: Upload checkpoints + logs
