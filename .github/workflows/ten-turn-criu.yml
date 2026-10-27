@@ -1,10 +1,3 @@
-Yes. Each of the first 10 turns now keeps the CRIU images, the exact API request and response, and a hash of all three. The job publishes that as a GitHub release tagged `trajectory-<run id>`.
-
-`contents: write` is set so the built-in token can create the release. The archive is `trajectory-<run id>.tar.gz` and contains `checkpoints/` plus `logs/api/turn-NN-request.json`, `turn-NN-response.json`, and `logs/trajectory.json`. The release notes include the per-turn hashes and the archive sha256.
-
-Replace `.github/workflows/ten-turn-criu.yml` with the file below and run it.
-
-```yaml
 name: "10-turn CRIU (free GLM-5.3-Flash)"
 
 on:
@@ -749,4 +742,3 @@ jobs:
           echo "===== SUMMARY ====="
           cat "${{ env.LOG_ROOT }}/summary.json" 2>/dev/null || true
           ls -la "${{ env.CKPT_ROOT }}" || true
-```
