@@ -70,7 +70,7 @@ jobs:
           cd criu
           git checkout ${{ env.CRIU_COMMIT }}
           make -j"$(nproc)"
-          sudo make install
+          sudo make install-criu
           sudo ldconfig
           sudo ln -sfn /usr/local/sbin/criu /usr/local/bin/criu
           criu --version
