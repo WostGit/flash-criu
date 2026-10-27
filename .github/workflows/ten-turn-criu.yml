@@ -1,3 +1,10 @@
+Yes. Each of the first 10 turns now keeps the CRIU images, the exact API request and response, and a hash of all three. The job publishes that as a GitHub release tagged `trajectory-<run id>`.
+
+`contents: write` is set so the built-in token can create the release. The archive is `trajectory-<run id>.tar.gz` and contains `checkpoints/` plus `logs/api/turn-NN-request.json`, `turn-NN-response.json`, and `logs/trajectory.json`. The release notes include the per-turn hashes and the archive sha256.
+
+Replace `.github/workflows/ten-turn-criu.yml` with the file below and run it.
+
+```yaml
 name: "10-turn CRIU (free GLM-5.3-Flash)"
 
 on:
@@ -21,7 +28,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
-      contents: read
+      contents: write
       actions: write
 
     steps:
@@ -533,7 +540,7 @@ jobs:
           bash "${{ env.WORKDIR }}/scripts/start_target.sh"
 
           python3 - << 'PY'
-          import os, json, time, subprocess
+          import hashlib, os, json, time, subprocess
           from pathlib import Path
           from openai import OpenAI
 
@@ -546,11 +553,19 @@ jobs:
           WORKDIR = os.environ["WORKDIR"]
           LOG_ROOT = os.environ["LOG_ROOT"]
           CKPT_ROOT = Path(os.environ["CKPT_ROOT"])
+          API_ROOT = Path(LOG_ROOT) / "api"
+          API_ROOT.mkdir(parents=True, exist_ok=True)
 
           def log(msg):
               line = time.strftime("%Y-%m-%d %H:%M:%S ") + msg
               print(line, flush=True)
               open(f"{LOG_ROOT}/agent.log", "a").write(line + "\n")
+
+          def canon(obj):
+              return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str).encode()
+
+          def sha256(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
 
           def criu(turn):
               r = subprocess.run(
@@ -577,9 +592,22 @@ jobs:
               {"role": "user", "content": "Start. The target is live and will be checkpointed after each turn."},
           ]
           summary = []
+          trajectory = []
+          running = hashlib.sha256()
 
           for turn in range(1, MAX_TURNS + 1):
               log(f"===== TURN {turn}/{MAX_TURNS} =====")
+              request = {
+                  "model": MODEL,
+                  "temperature": 0.2,
+                  "max_tokens": 200,
+                  "messages": history,
+              }
+              req_bytes = canon(request)
+              req_hash = sha256(req_bytes)
+              (API_ROOT / f"turn-{turn:02d}-request.json").write_bytes(req_bytes + b"\n")
+
+              response = None
               try:
                   resp = client.chat.completions.create(
                       model=MODEL,
@@ -587,24 +615,63 @@ jobs:
                       temperature=0.2,
                       max_tokens=200,
                   )
+                  response = resp.model_dump() if hasattr(resp, "model_dump") else json.loads(resp.model_dump_json())
               except Exception as e:
                   log(f"LLM error: {e}")
-                  summary.append({"turn": turn, "status": "llm_error", "error": str(e)})
+                  response = {"error": str(e)}
+                  resp_bytes = canon(response)
+                  resp_hash = sha256(resp_bytes)
+                  (API_ROOT / f"turn-{turn:02d}-response.json").write_bytes(resp_bytes + b"\n")
+                  running.update(req_hash.encode())
+                  running.update(resp_hash.encode())
+                  row = {
+                      "turn": turn,
+                      "status": "llm_error",
+                      "error": str(e),
+                      "request_sha256": req_hash,
+                      "response_sha256": resp_hash,
+                      "trajectory_sha256": running.hexdigest(),
+                  }
+                  summary.append(row)
+                  trajectory.append(row)
                   break
 
-              msg = (resp.choices[0].message.content or "").strip()
-              history.append({"role": "assistant", "content": msg})
+              resp_bytes = canon(response)
+              resp_hash = sha256(resp_bytes)
+              (API_ROOT / f"turn-{turn:02d}-response.json").write_bytes(resp_bytes + b"\n")
+
+              msg = (response.get("choices") or [{}])[0].get("message") or {}
+              text = (msg.get("content") or "").strip()
+              history.append({"role": "assistant", "content": text})
               history.append({"role": "user", "content": f"Turn {turn} complete. Continue."})
-              log(f"Model: {msg[:240]}")
+              log(f"Model: {text[:240]}")
 
               ok, extra = criu(turn)
               inv = invariant()
+              running.update(req_hash.encode())
+              running.update(resp_hash.encode())
+              running.update((extra.get("pages_sha256") or "").encode())
+              running.update((extra.get("state_page_masked_sha256") or "").encode())
+              running.update((extra.get("state_page_masked_sha256_after") or "").encode())
               row = {"turn": turn, "invariant": inv}
               row.update(extra)
               row["checkpoint_ok"] = ok
+              row["request_sha256"] = req_hash
+              row["response_sha256"] = resp_hash
+              row["trajectory_sha256"] = running.hexdigest()
               summary.append(row)
+              trajectory.append({
+                  "turn": turn,
+                  "checkpoint_ok": ok,
+                  "request_sha256": req_hash,
+                  "response_sha256": resp_hash,
+                  "pages_sha256": extra.get("pages_sha256"),
+                  "state_page_masked_sha256": extra.get("state_page_masked_sha256"),
+                  "state_page_masked_sha256_after": extra.get("state_page_masked_sha256_after"),
+                  "trajectory_sha256": row["trajectory_sha256"],
+              })
               log(
-                  "ok=%s nonce=%s counter=%s->%s pages=%s masked=%s"
+                  "ok=%s nonce=%s counter=%s->%s pages=%s masked=%s req=%s resp=%s"
                   % (
                       ok,
                       row.get("nonce"),
@@ -612,11 +679,19 @@ jobs:
                       row.get("counter_after"),
                       (row.get("pages_sha256") or "")[:12],
                       (row.get("state_page_masked_sha256") or "")[:12],
+                      req_hash[:12],
+                      resp_hash[:12],
                   )
               )
               time.sleep(1.5)
 
+          traj = {
+              "turns": trajectory,
+              "final_trajectory_sha256": running.hexdigest(),
+          }
+          open(f"{LOG_ROOT}/trajectory.json", "w").write(json.dumps(traj, indent=2))
           open(f"{LOG_ROOT}/summary.json", "w").write(json.dumps(summary, indent=2))
+          log("trajectory " + running.hexdigest())
           log("Done")
           if not summary or not all(s.get("checkpoint_ok") for s in summary):
               raise SystemExit(1)
@@ -632,9 +707,46 @@ jobs:
             ${{ env.LOG_ROOT }}
           retention-days: 14
 
+      - name: Publish trajectory release
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f "${{ env.LOG_ROOT }}/summary.json" ]]; then
+            echo "No trajectory to release"
+            exit 0
+          fi
+          ARCHIVE="${{ github.workspace }}/trajectory-${{ github.run_id }}.tar.gz"
+          tar -C "${{ env.WORKDIR }}" -czf "$ARCHIVE" checkpoints logs
+          sha256sum "$ARCHIVE" | tee "${{ env.LOG_ROOT }}/archive.sha256"
+          NOTES="${{ env.LOG_ROOT }}/release-notes.md"
+          {
+            echo "# Trajectory ${{ github.run_id }}"
+            echo
+            echo "First 10 turns. Each turn stores the API request, the API response, the CRIU images, and the hashes below."
+            echo
+            echo '```json'
+            cat "${{ env.LOG_ROOT }}/trajectory.json" 2>/dev/null || echo "{}"
+            echo '```'
+            echo
+            echo "Archive sha256:"
+            echo
+            echo '```'
+            cat "${{ env.LOG_ROOT }}/archive.sha256"
+            echo '```'
+          } > "$NOTES"
+          gh release create "trajectory-${{ github.run_id }}" \
+            "$ARCHIVE" \
+            --repo "${{ github.repository }}" \
+            --title "Trajectory ${{ github.run_id }}" \
+            --notes-file "$NOTES" \
+            --target "${{ github.sha }}"
+
       - name: Summary
         if: always()
         run: |
           echo "===== SUMMARY ====="
           cat "${{ env.LOG_ROOT }}/summary.json" 2>/dev/null || true
           ls -la "${{ env.CKPT_ROOT }}" || true
+```
