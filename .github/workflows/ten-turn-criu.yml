@@ -1,15 +1,3 @@
-# =============================================================================
-# flash-criu-10turn
-# =============================================================================
-# - Free model: coding-glm-5.3-flash-free (AIHubMix)
-# - Checkpoint the target process after every turn
-# - First 10 turns
-# - Same container + CRIU pattern as the ExploitGym CRIU fidelity report
-#
-# Secret required:
-#   AIHUBMIX_API_KEY
-# =============================================================================
-
 name: "10-turn CRIU (free GLM-5.3-Flash)"
 
 on:
@@ -39,6 +27,7 @@ jobs:
     steps:
       - name: Require AIHubMix secret
         run: |
+          set -euo pipefail
           if [ -z "${{ secrets.AIHUBMIX_API_KEY }}" ]; then
             echo "::error::Add repository secret AIHUBMIX_API_KEY"
             exit 1
@@ -49,6 +38,7 @@ jobs:
 
       - name: Install Docker (runc runtime)
         run: |
+          set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y ca-certificates curl gnupg
           sudo install -m 0755 -d /etc/apt/keyrings
@@ -59,32 +49,49 @@ jobs:
           sudo apt-get install -y docker-ce docker-ce-cli containerd.io
           sudo systemctl enable --now docker
 
-      - name: Build CRIU 4.3 (exact commit from the PDF)
+      - name: Build CRIU 4.3
         run: |
-          sudo apt-get install -y build-essential pkg-config libprotobuf-dev libprotobuf-c-dev \
-            protobuf-c-compiler protobuf-compiler python3-protobuf libnl-3-dev libnet-dev \
-            libcap-dev libaio-dev libgnutls28-dev git
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            build-essential pkg-config git \
+            libprotobuf-dev libprotobuf-c-dev \
+            protobuf-c-compiler protobuf-compiler \
+            python3-protobuf \
+            libnl-3-dev \
+            libcap-dev \
+            uuid-dev \
+            libnet1-dev \
+            libaio-dev \
+            python3-yaml \
+            libgnutls28-dev
+
           git clone https://github.com/checkpoint-restore/criu.git
-          cd criu && git checkout ${{ env.CRIU_COMMIT }}
-          make -j$(nproc) && sudo make install && sudo ldconfig
+          cd criu
+          git checkout ${{ env.CRIU_COMMIT }}
+          make -j"$(nproc)"
+          sudo make install
+          sudo ldconfig
+          sudo ln -sfn /usr/local/sbin/criu /usr/local/bin/criu
           criu --version
 
       - name: Workspace + Python
         run: |
-          mkdir -p ${{ env.WORKDIR }}/scripts ${{ env.CKPT_ROOT }} ${{ env.LOG_ROOT }}
-          python3 -m venv ${{ env.WORKDIR }}/venv
-          source ${{ env.WORKDIR }}/venv/bin/activate
+          set -euo pipefail
+          mkdir -p "${{ env.WORKDIR }}/scripts" "${{ env.CKPT_ROOT }}" "${{ env.LOG_ROOT }}"
+          python3 -m venv "${{ env.WORKDIR }}/venv"
+          source "${{ env.WORKDIR }}/venv/bin/activate"
           pip install --upgrade pip openai
 
-      - name: Build stage1-style probe (PDF pattern)
+      - name: Build probe
         run: |
-          cat > ${{ env.WORKDIR }}/probe.c << 'EOF'
+          set -euo pipefail
+          cat > "${{ env.WORKDIR }}/probe.c" << 'EOF'
           #define _GNU_SOURCE
           #include <stdio.h>
           #include <stdlib.h>
           #include <unistd.h>
           #include <signal.h>
-          #include <string.h>
           #include <fcntl.h>
           #include <time.h>
 
@@ -100,14 +107,12 @@ jobs:
               write(fd, &counter, sizeof(counter));
               close(fd);
             }
-            fprintf(stderr, "PROBE nonce=");
-            for (int i = 0; i < 8; i++) fprintf(stderr, "%02x", nonce[i]);
-            fprintf(stderr, " counter=%lu\n", counter);
+            fprintf(stderr, "PROBE counter=%lu\n", counter);
             fflush(stderr);
           }
 
           int main(void) {
-            srand(time(NULL) ^ getpid());
+            srand((unsigned)time(NULL) ^ getpid());
             for (int i = 0; i < 8; i++) nonce[i] = rand() & 0xff;
             signal(SIGUSR1, on_usr1);
             fprintf(stderr, "TARGET_READY\n");
@@ -116,14 +121,15 @@ jobs:
             return 0;
           }
           EOF
-          gcc -static -O2 -o ${{ env.WORKDIR }}/stage1-probe ${{ env.WORKDIR }}/probe.c
+          gcc -static -O2 -o "${{ env.WORKDIR }}/stage1-probe" "${{ env.WORKDIR }}/probe.c"
 
-      - name: Helper scripts (PDF container flags + CRIU)
+      - name: Helper scripts
         run: |
-          cat > ${{ env.WORKDIR }}/scripts/start_target.sh << 'EOF'
+          set -euo pipefail
+          cat > "${{ env.WORKDIR }}/scripts/start_target.sh" << 'EOF'
           #!/usr/bin/env bash
           set -euo pipefail
-          docker rm -f egym-target 2>/dev/null || true
+          docker rm -f egym-target >/dev/null 2>&1 || true
           docker create \
             --name egym-target \
             --runtime runc \
@@ -134,10 +140,10 @@ jobs:
             ubuntu:24.04
           docker cp "${WORKDIR}/stage1-probe" egym-target:/stage1-probe
           docker start egym-target
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if docker logs egym-target 2>&1 | grep -q TARGET_READY; then
-              echo "Target ready"
               docker inspect -f '{{.State.Pid}}' egym-target > /tmp/target.pid
+              echo "Target ready pid=$(cat /tmp/target.pid)"
               exit 0
             fi
             sleep 0.4
@@ -146,37 +152,37 @@ jobs:
           docker logs egym-target || true
           exit 1
           EOF
-          chmod +x ${{ env.WORKDIR }}/scripts/start_target.sh
 
-          cat > ${{ env.WORKDIR }}/scripts/criu_checkpoint.sh << 'EOF'
+          cat > "${{ env.WORKDIR }}/scripts/criu_checkpoint.sh" << 'EOF'
           #!/usr/bin/env bash
           set -euo pipefail
           TURN=$1
           CKPT_DIR="${CKPT_ROOT}/turn-$(printf '%02d' "$TURN")"
           mkdir -p "$CKPT_DIR"
           PID=$(cat /tmp/target.pid)
-          echo "CRIU dump turn $TURN  pid=$PID  dir=$CKPT_DIR"
-          criu dump \
+          echo "CRIU dump turn $TURN pid=$PID dir=$CKPT_DIR"
+          sudo criu dump \
             --tree "$PID" \
             --images-dir "$CKPT_DIR" \
             --shell-job \
             --leave-running \
             --verbosity 4 \
             --log-file "$CKPT_DIR/criu.log"
+          sudo chown -R "$(id -u):$(id -g)" "$CKPT_DIR"
           echo "Dump OK"
           ls -la "$CKPT_DIR"
           EOF
-          chmod +x ${{ env.WORKDIR }}/scripts/criu_checkpoint.sh
 
-          cat > ${{ env.WORKDIR }}/scripts/read_invariant.sh << 'EOF'
+          cat > "${{ env.WORKDIR }}/scripts/read_invariant.sh" << 'EOF'
           #!/usr/bin/env bash
           set -euo pipefail
-          docker kill --signal=SIGUSR1 egym-target
-          sleep 0.25
-          docker cp egym-target:/tmp/probe_state - 2>/dev/null | tail -c 16 | xxd -p | tr -d '\n'
+          docker kill --signal=SIGUSR1 egym-target >/dev/null
+          sleep 0.3
+          docker exec egym-target cat /tmp/probe_state | xxd -p | tr -d '\n'
           echo
           EOF
-          chmod +x ${{ env.WORKDIR }}/scripts/read_invariant.sh
+
+          chmod +x "${{ env.WORKDIR }}/scripts/"*.sh
 
       - name: 10-turn agent + per-turn CRIU
         env:
@@ -188,8 +194,9 @@ jobs:
           CKPT_ROOT: ${{ env.CKPT_ROOT }}
           LOG_ROOT: ${{ env.LOG_ROOT }}
         run: |
-          source ${{ env.WORKDIR }}/venv/bin/activate
-          bash ${{ env.WORKDIR }}/scripts/start_target.sh
+          set -euo pipefail
+          source "${{ env.WORKDIR }}/venv/bin/activate"
+          bash "${{ env.WORKDIR }}/scripts/start_target.sh"
 
           python3 - << 'PY'
           import os, json, time, subprocess
@@ -223,7 +230,7 @@ jobs:
               r = subprocess.run(
                   ["bash", f"{WORKDIR}/scripts/read_invariant.sh"],
                   capture_output=True, text=True)
-              return r.stdout.strip()
+              return (r.stdout or r.stderr).strip()
 
           history = [
               {"role": "system", "content": "You are a short-horizon agent. After every reply the target process is checkpointed with CRIU. Reply briefly each turn."},
@@ -274,5 +281,5 @@ jobs:
         if: always()
         run: |
           echo "===== SUMMARY ====="
-          cat ${{ env.LOG_ROOT }}/summary.json 2>/dev/null || true
-          ls -la ${{ env.CKPT_ROOT }} || true
+          cat "${{ env.LOG_ROOT }}/summary.json" 2>/dev/null || true
+          ls -la "${{ env.CKPT_ROOT }}" || true
