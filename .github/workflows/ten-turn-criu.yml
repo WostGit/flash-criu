@@ -1,8 +1,9 @@
 name: "10-turn CRIU (v8 human/446124892)"
 # Real image, real d8, one snapshot per turn.
 # A turn is kept only when the restored process has the same
-# STG1MARK nonce, turn, and counter, those bytes are in both
-# page dumps, and the restored pstree image is not a copy.
+# STG1MARK nonce and turn, the counter then advances, and the
+# second page dump contains that advanced marker. An unchanged
+# pstree image is normal for this process and is not a failure.
 # record stores every API call. audit recomputes the hashes
 # and does not start Docker. branch restores a saved node.
 
@@ -342,28 +343,27 @@ jobs:
                   errors.append("pages hash is not distinct from the parent turn")
               if not (criu / "inventory.img").is_file() or not (restored / "inventory.img").is_file():
                   errors.append("missing inventory.img")
-              pstree = criu / "pstree.img"
-              pstree_r = restored / "pstree.img"
-              if not pstree.is_file() or not pstree_r.is_file():
-                  errors.append("missing pstree.img")
-              else:
-                  a = sha256_file(pstree)
-                  b = sha256_file(pstree_r)
-                  if a == b:
-                      errors.append("restored pstree.img is a copy of the dump")
-                  if result.get("pstree_sha256") != a or result.get("pstree_restored_sha256") != b:
-                      errors.append("pstree hash mismatch")
+              try:
+                  rest_hex, _rest_per = pages_sha256(restored)
+              except Exception as exc:
+                  errors.append(str(exc))
+                  return errors
+              if result.get("pages_restored_sha256") != rest_hex:
+                  errors.append("pages_restored_sha256 mismatch")
+              if rest_hex == pages_hex:
+                  errors.append("restored pages are a copy of the dump")
               live = markers_in_pages(criu)
               back = markers_in_pages(restored)
               want_nonce = result.get("nonce")
               want_turn = result.get("turn")
               want_counter = result.get("counter")
-              def pick(found):
-                  return [m for m in found if m["nonce"] == want_nonce and m["turn"] == want_turn and m["counter"] == want_counter]
-              if not pick(live):
+              want_restored = result.get("restored_counter")
+              if not any(m["nonce"] == want_nonce and m["turn"] == want_turn and m["counter"] == want_counter for m in live):
                   errors.append("dump pages do not contain the recorded marker")
-              if not pick(back):
-                  errors.append("restored pages do not contain the recorded marker")
+              if not isinstance(want_restored, int) or not isinstance(want_counter, int) or want_restored <= want_counter:
+                  errors.append("restored counter did not advance")
+              elif not any(m["nonce"] == want_nonce and m["turn"] == want_turn and m["counter"] == want_restored for m in back):
+                  errors.append("restored pages do not contain the advanced marker")
               upper = node_dir / "upper.tar.gz"
               if not upper.is_file():
                   errors.append("missing upper.tar.gz")
@@ -439,9 +439,9 @@ jobs:
                   (criu / "pstree.img").write_bytes(b"pid-a")
                   (criu / "inventory.img").write_bytes(b"inv")
                   restored_pages = bytearray(raw)
-                  restored_pages[0] = 9  # a non-marker byte may change; marker stays
+                  restored_pages[108:116] = struct.pack("<Q", 5)
                   (back / "pages-1.img").write_bytes(bytes(restored_pages))
-                  (back / "pstree.img").write_bytes(b"pid-b")
+                  (back / "pstree.img").write_bytes(b"pid-a")
                   (back / "inventory.img").write_bytes(b"inv2")
                   (nodes / "upper.tar.gz").write_bytes(b"upper")
                   (nodes / "program.js").write_text("print(1)\nwhile (true) {}\n")
@@ -456,12 +456,15 @@ jobs:
                   history = [{"role": "user", "content": "start"}]
                   (nodes / "history.json").write_text(json.dumps(history, sort_keys=True, separators=(",", ":")))
                   pages_hex, per = pages_sha256(criu)
+                  rest_hex, _rest_per = pages_sha256(back)
                   result = {
                       "checkpoint_ok": True,
                       "nonce": "0011223344556677",
                       "turn": 7,
                       "counter": 4,
+                      "restored_counter": 5,
                       "pages_sha256": pages_hex,
+                      "pages_restored_sha256": rest_hex,
                       "pages": per,
                       "request_sha256": sha256_file(nodes / "request.json"),
                       "response_sha256": sha256_file(nodes / "response.json"),
@@ -489,8 +492,8 @@ jobs:
                   if not any("response_sha256" in e for e in errs):
                       raise SystemExit("selftest missed a changed API response")
                   (nodes / "response.json").write_text(json.dumps(response, sort_keys=True, separators=(",", ":")))
-                  (back / "pstree.img").write_bytes(b"pid-a")
-                  result["pstree_restored_sha256"] = sha256_file(back / "pstree.img")
+                  (back / "pages-1.img").write_bytes(bytes(raw))
+                  result["pages_restored_sha256"] = pages_sha256(back)[0]
                   (nodes / "result.json").write_text(json.dumps(result))
                   errs = check_tree(root)
                   if not any("copy" in e for e in errs):
@@ -771,6 +774,23 @@ jobs:
                   raise RuntimeError("pages do not contain the live marker " + want)
           
           
+          def nudge(turn, prev_counter):
+              run(["docker", "exec", "egym-target", "sh", "-c", "printf '%s' %d > /tmp/v8/bump" % int(turn)])
+              last = b""
+              for _ in range(80):
+                  proc = run_bin(["docker", "exec", "egym-target", "cat", "/tmp/probe_state"], check=False)
+                  last = proc.stdout or b""
+                  if len(last) >= 32:
+                      found = verify.parse_marker(last[:32])
+                      if found and found[0]["turn"] == int(turn) and found[0]["counter"] > prev_counter:
+                          rec, raw = read_marker()
+                          if rec["counter"] <= prev_counter or rec["turn"] != int(turn):
+                              raise RuntimeError("nudge reread lost the counter")
+                          return rec, raw
+                  time.sleep(0.1)
+              raise RuntimeError("keeper did not advance the counter (%s)" % last.hex())
+          
+          
           def snapshot_turn(node, turn, expected_raw):
               node_dir = Path(os.environ["NODES_ROOT"]) / node
               node_dir.mkdir(parents=True, exist_ok=True)
@@ -784,26 +804,27 @@ jobs:
                   raise RuntimeError(
                       "restored marker mismatch live=%s restored=%s" % (expected_raw.hex(), restored_raw.hex())
                   )
+              advanced, advanced_raw = nudge(turn, restored["counter"])
+              if advanced["nonce"] != restored["nonce"] or advanced["turn"] != restored["turn"]:
+                  raise RuntimeError("nudge changed the process identity")
               post = name + "b"
-              take_snapshot(node_dir, post, "criu-restored")
-              marker_in(node_dir / "criu-restored", expected_raw)
-              pre_tree = sha_file(node_dir / "criu" / "pstree.img")
-              post_tree = sha_file(node_dir / "criu-restored" / "pstree.img")
-              if pre_tree == post_tree:
-                  raise RuntimeError("restored pstree.img is a copy of the dump")
+              post_hex, _post_per = take_snapshot(node_dir, post, "criu-restored")
+              marker_in(node_dir / "criu-restored", advanced_raw)
+              if post_hex == pages_hex:
+                  raise RuntimeError("restored pages are a copy of the dump")
               restore(name)
               again, again_raw = read_marker()
               if again_raw != expected_raw:
                   raise RuntimeError("marker changed after returning to the recorded snapshot")
               return {
                   "pages_sha256": pages_hex,
+                  "pages_restored_sha256": post_hex,
                   "pages": per,
-                  "pstree_sha256": pre_tree,
-                  "pstree_restored_sha256": post_tree,
                   "upper_sha256": sha_file(upper),
                   "nonce": restored["nonce"],
                   "turn": restored["turn"],
                   "counter": restored["counter"],
+                  "restored_counter": advanced["counter"],
               }
           
           
@@ -847,10 +868,14 @@ jobs:
           
           def extract_js(text):
               blocks = re.findall(r"```(?:javascript|js)?\s*\n(.*?)```", text or "", re.S)
-              body = (blocks[-1] if blocks else (text or "")).strip() + "\n"
-              if "while (true)" not in body and "while(true)" not in body:
-                  body += "while (true) {}\n"
-              return body
+              body = (blocks[-1] if blocks else (text or "")).strip()
+              body = re.sub(r"\s*while\s*\(\s*true\s*\)\s*\{\s*\}\s*$", "", body).strip()
+              return (
+                  "try {\n" + body + "\n} catch (e) {\n"
+                  "  if (typeof print === 'function') print('EXN ' + e);\n"
+                  "  else console.log('EXN ' + e);\n"
+                  "}\nwhile (true) {}\n"
+              )
           
           
           def classify(obs, flag):
