@@ -663,20 +663,33 @@ jobs:
           
           
           def restore(name):
-              root = str(Path(os.environ["WORKDIR"]) / "ckpts")
+              # docker start rejects --checkpoint-dir (moby #37344). Copy the
+              # checkpoint into this container's own checkpoints directory.
+              src = Path(os.environ["WORKDIR"]) / "ckpts" / name
+              if not src.is_dir():
+                  raise RuntimeError("missing checkpoint " + str(src))
+              cid = run(["docker", "inspect", "-f", "{{.Id}}", "egym-target"]).stdout.strip()
+              parent = Path("/var/lib/docker/containers") / cid / "checkpoints"
+              dest = parent / name
+              run(["sudo", "mkdir", "-p", str(parent)])
+              run(["sudo", "rm", "-rf", str(dest)])
+              run(["sudo", "cp", "-a", str(src), str(dest)])
+              running = run(["docker", "inspect", "-f", "{{.State.Running}}", "egym-target"]).stdout.strip()
+              if running == "true":
+                  run(["docker", "stop", "-t", "5", "egym-target"])
               last = ""
               for attempt in range(1, 4):
-                  proc = run(["docker", "start", "--checkpoint", name, "--checkpoint-dir", root, "egym-target"], check=False)
+                  proc = run(["docker", "start", "--checkpoint", name, "egym-target"], check=False)
                   time.sleep(0.6)
                   state = run(["docker", "inspect", "-f", "{{.State.Running}}", "egym-target"], check=False)
                   if proc.returncode == 0 and (state.stdout or "").strip() == "true":
                       return
                   last = (proc.stdout or "") + (proc.stderr or "")
-                  log(f"restore {name} attempt {attempt} failed: {last[-500:]}")
+                  log(f"restore {name} attempt {attempt} failed: {last[-800:]}")
                   time.sleep(1)
               raise RuntimeError("restore failed: " + last[-2000:])
-          
-          
+
+
           def unpack(src, dest):
               if dest.exists():
                   run(["sudo", "rm", "-rf", str(dest)])
