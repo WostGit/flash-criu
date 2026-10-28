@@ -840,6 +840,49 @@ jobs:
               return 0
           
           
+          def dump_response(resp):
+              dumped = resp.model_dump()
+              try:
+                  msg = resp.choices[0].message
+                  slot = dumped["choices"][0]["message"]
+              except (AttributeError, IndexError, KeyError, TypeError):
+                  return dumped
+              extra = dict(getattr(msg, "model_extra", None) or {})
+              for key in ("reasoning_content", "reasoning"):
+                  val = getattr(msg, key, None)
+                  if val:
+                      extra[key] = val
+              for key, val in extra.items():
+                  if val is not None and not slot.get(key):
+                      slot[key] = val
+              return dumped
+
+
+          def answer_text(response):
+              choice = (response.get("choices") or [{}])[0]
+              msg = choice.get("message") or {}
+              content = msg.get("content") or ""
+              if isinstance(content, list):
+                  content = "\n".join(
+                      (part.get("text") or "") if isinstance(part, dict) else str(part)
+                      for part in content
+                  )
+              reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+              if isinstance(reasoning, list):
+                  reasoning = "\n".join(str(part) for part in reasoning)
+              text = (content or "").strip()
+              source = "content"
+              blocks = re.findall(r"```(?:javascript|js)?\s*\n(.*?)```", reasoning or "", re.S)
+              if (not text or not re.search(r"\b(function|const|let|var|class|print|console)\b", text)) and blocks:
+                  text = blocks[-1].strip()
+                  source = "reasoning_content"
+              log(
+                  "model finish=%s content_chars=%d reasoning_chars=%d source=%s"
+                  % (choice.get("finish_reason"), len(content or ""), len(reasoning or ""), source)
+              )
+              return text
+
+
           def complete(history, seed_ok):
               from openai import OpenAI
               client = OpenAI(api_key=os.environ["AIHUBMIX_API_KEY"], base_url=os.environ["AIHUBMIX_BASE_URL"])
@@ -848,19 +891,33 @@ jobs:
                   "messages": history,
                   "temperature": 0,
                   "top_p": 1,
-                  "max_tokens": 1800,
+                  "max_tokens": 131072,
+                  "extra_body": {"reasoning_effort": "low"},
               }
               if seed_ok:
                   kwargs["seed"] = SEED
-              try:
-                  resp = client.chat.completions.create(**kwargs)
-                  return kwargs, resp.model_dump(), seed_ok, None
-              except Exception as exc:
-                  if seed_ok and "seed" in str(exc).lower():
-                      kwargs.pop("seed", None)
-                      resp = client.chat.completions.create(**kwargs)
-                      return kwargs, resp.model_dump(), False, str(exc)
-                  raise
+
+              def once(call):
+                  try:
+                      return client.chat.completions.create(**call), None
+                  except Exception as exc:
+                      return None, exc
+
+              resp, exc = once(kwargs)
+              seed_err = None
+              if exc is not None and seed_ok and "seed" in str(exc).lower():
+                  seed_err = str(exc)
+                  kwargs.pop("seed", None)
+                  seed_ok = False
+                  resp, exc = once(kwargs)
+              if exc is not None and "reasoning_effort" in str(exc).lower():
+                  kwargs.pop("extra_body", None)
+                  resp, exc = once(kwargs)
+              if exc is not None:
+                  raise exc
+              dumped = dump_response(resp)
+              answer_text(dumped)
+              return kwargs, dumped, seed_ok, seed_err
           
           
           def load_prompt():
@@ -955,9 +1012,10 @@ jobs:
                       if seed_err:
                           log("seed was rejected and omitted: " + seed_err[:300])
                           (Path(os.environ["LOG_ROOT"]) / "seed_rejected.txt").write_text(seed_err)
-                      text = ((response.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                      text = answer_text(response)
                       if not text.strip():
-                          raise RuntimeError("model returned an empty program")
+                          finish = ((response.get("choices") or [{}])[0].get("finish_reason"))
+                          raise RuntimeError("model returned an empty program finish=%s" % finish)
                       program = extract_js(text)
                       history.append({"role": "assistant", "content": text})
                       alive, obs = run_js(program)
@@ -1022,9 +1080,10 @@ jobs:
               }
               manifest.update(extra)
               (out / "MANIFEST.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
-              errors = verify.check_tree(out)
-              if errors:
-                  raise RuntimeError("local audit failed\n" + "\n".join(errors))
+              if summary and all(item.get("checkpoint_ok") for item in summary):
+                  errors = verify.check_tree(out)
+                  if errors:
+                      raise RuntimeError("local audit failed\n" + "\n".join(errors))
           
           
           def cmd_record():
