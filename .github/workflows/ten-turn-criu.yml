@@ -775,7 +775,7 @@ jobs:
           
           
           def nudge(turn, prev_counter):
-              run(["docker", "exec", "egym-target", "sh", "-c", "printf '%s' %d > /tmp/v8/bump" % int(turn)])
+              run(["docker", "exec", "egym-target", "sh", "-c", f"printf '%s' {int(turn)} > /tmp/v8/bump"])
               last = b""
               for _ in range(80):
                   proc = run_bin(["docker", "exec", "egym-target", "cat", "/tmp/probe_state"], check=False)
