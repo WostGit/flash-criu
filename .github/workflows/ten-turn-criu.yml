@@ -584,13 +584,36 @@ jobs:
               raise RuntimeError("target did not become ready\n" + (logs.stdout or "") + (logs.stderr or ""))
           
           
+          def ensure_netns():
+              # The target must not own a Docker netns. docker start --checkpoint
+              # otherwise bind-mounts /proc/0/ns/net, and pid 0 does not exist.
+              # This process only holds the namespace and is never checkpointed.
+              state = run(["docker", "inspect", "-f", "{{.State.Running}}", "net-keeper"], check=False)
+              if (state.stdout or "").strip() == "true":
+                  return
+              run(["docker", "rm", "-f", "net-keeper"], check=False)
+              base = [
+                  "docker", "run", "-d",
+                  "--name", "net-keeper",
+                  "--runtime", "runc",
+                  "--network", "none",
+                  "--security-opt", "seccomp=unconfined",
+                  "--security-opt", "apparmor=unconfined",
+              ]
+              proc = run(base + ["--entrypoint", "/bin/sleep", IMAGE, "infinity"], check=False)
+              if proc.returncode != 0:
+                  run(["docker", "rm", "-f", "net-keeper"], check=False)
+                  run(base + ["--entrypoint", "/bin/bash", IMAGE, "-c", "sleep infinity"])
+          
+          
           def create_container():
+              ensure_netns()
               run(["docker", "rm", "-f", "egym-target"], check=False)
               run([
                   "docker", "create",
                   "--name", "egym-target",
                   "--runtime", "runc",
-                  "--network", "none",
+                  "--network", "container:net-keeper",
                   "--security-opt", "seccomp=unconfined",
                   "--security-opt", "apparmor=unconfined",
                   "--entrypoint", "/opt/keeper",
